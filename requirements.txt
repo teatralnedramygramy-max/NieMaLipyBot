@@ -1,0 +1,4 @@
+aiogram==3.3.0
+flask
+psycopg2-binary
+aiogram==3.3.0
