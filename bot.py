@@ -149,7 +149,11 @@ async def flow(message: types.Message):
         state["step"]="q2"
         await message.answer("⏱️ Czas realizacji 1-5")
 
-    elif state["step"]=="q2":
-        state["q2"]=int(text)
-        state["step"]="q3"
-        await
+ elif state["step"]=="q2":
+    try:
+    state["q2"]=int(text)
+except:
+    await message.answer("Podaj liczbę od 1 do 5")
+    return
+    state["step"]="q3"
+    await message.answer("📦 Zgodność z opisem 1-5")
