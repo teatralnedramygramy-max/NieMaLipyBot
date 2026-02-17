@@ -131,5 +131,11 @@ async def show_top_sellers(message: types.Message):
         await message.answer(f"Błąd: {e}")
 
 # --- START ---
+import asyncio
+
+async def main():
+    print("Bot i baza danych gotowe!")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
