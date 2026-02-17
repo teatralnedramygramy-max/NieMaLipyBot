@@ -1,140 +1,222 @@
 import os
+import asyncio
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils import executor
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 
-# --- KONFIG ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
-# --- MENU ---
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton("➕ Dodaj sprzedawcę")],
-        [KeyboardButton("⭐ Oceń sprzedawcę")],
-        [KeyboardButton("🔍 Sprawdź sprzedawcę")],
-        [KeyboardButton("👤 Sprawdź klienta")],
-        [KeyboardButton("🏆 TOP sprzedawców")]
-    ],
-    resize_keyboard=True
-)
+conn = psycopg2.connect(DATABASE_URL)
+cur = conn.cursor()
 
-# --- POŁĄCZENIE Z BAZĄ ---
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# --- TABLES ---
+cur.execute("""
+CREATE TABLE IF NOT EXISTS sellers (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    avg_rating FLOAT DEFAULT 0,
+    rating_count INT DEFAULT 0,
+    reports_count INT DEFAULT 0,
+    risk_status TEXT DEFAULT '🆕 Nowy użytkownik'
+);
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS ratings (
+    id SERIAL PRIMARY KEY,
+    seller_id INT REFERENCES sellers(id),
+    reviewer_username TEXT,
+    product_quality INT,
+    delivery_time INT,
+    communication INT,
+    bhp INT,
+    comment TEXT,
+    UNIQUE(seller_id, reviewer_username)
+);
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS reports (
+    id SERIAL PRIMARY KEY,
+    seller_id INT REFERENCES sellers(id),
+    reporter_username TEXT,
+    description TEXT,
+    UNIQUE(seller_id, reporter_username)
+);
+""")
+
+conn.commit()
+
+weights = {
+    "product_quality":0.4,
+    "delivery_time":0.25,
+    "communication":0.2,
+    "bhp":0.15
+}
+
+def calculate_avg(ratings):
+    total = 0
+    for r in ratings:
+        total += (
+            r[0]*0.4 +
+            r[1]*0.25 +
+            r[2]*0.2 +
+            r[3]*0.15
+        )
+    return round(total/len(ratings),2)
+
+def update_status(seller_id):
+    cur.execute("SELECT rating_count, avg_rating, reports_count FROM sellers WHERE id=%s",(seller_id,))
+    rating_count, avg, reports = cur.fetchone()
+
+    if reports >=5:
+        status = "⚫ Blacklisted"
+    elif rating_count <5:
+        status = "🆕 Nowy użytkownik"
+    elif avg >4.3:
+        status = "🟢 Verified Safe"
+    elif avg >=3:
+        status = "🟡 Caution"
+    else:
+        status = "🔴 High Risk"
+
+    cur.execute("UPDATE sellers SET risk_status=%s WHERE id=%s",(status,seller_id))
+    conn.commit()
+
+user_state = {}
 
 # --- START ---
-@dp.message_handler(commands=['start'])
+@dp.message(Command("start"))
 async def start(message: types.Message):
-    await message.answer("Wybierz opcję:", reply_markup=keyboard)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Oceń sprzedawcę", callback_data="rate")],
+        [InlineKeyboardButton(text="🚨 Zgłoś sprzedawcę", callback_data="report")],
+        [InlineKeyboardButton(text="🔍 Sprawdź sprzedawcę", callback_data="check")],
+        [InlineKeyboardButton(text="🏆 TOP sprzedawców", callback_data="top")]
+    ])
+    await message.answer("Wybierz opcję:", reply_markup=kb)
 
-# --- HANDLERY MENU ---
-@dp.message_handler()
-async def handle_message(message: types.Message):
+# --- CALLBACK MENU ---
+@dp.callback_query()
+async def menu(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+
+    if callback.data == "rate":
+        user_state[uid] = {"step":"username"}
+        await callback.message.answer("Podaj @username sprzedawcy")
+
+    elif callback.data == "report":
+        user_state[uid] = {"step":"report_username"}
+        await callback.message.answer("Podaj @username sprzedawcy")
+
+    elif callback.data == "check":
+        await callback.message.answer("Użyj komendy: /check @username")
+
+    elif callback.data == "top":
+        cur.execute("SELECT username, avg_rating, rating_count FROM sellers ORDER BY avg_rating DESC LIMIT 5")
+        rows = cur.fetchall()
+        text="🏆 TOP 5 sprzedawców:\n"
+        for i,r in enumerate(rows,1):
+            text += f"{i}. @{r[0]} ⭐ {r[1]} ({r[2]} opinii)\n"
+        await callback.message.answer(text)
+
+# --- CHECK ---
+@dp.message(Command("check"))
+async def check(message: types.Message):
+    username = message.text.split()[1]
+    cur.execute("SELECT username, avg_rating, rating_count, reports_count, risk_status FROM sellers WHERE username=%s",(username,))
+    row = cur.fetchone()
+    if not row:
+        await message.answer("Brak sprzedawcy")
+        return
+
+    await message.answer(
+        f"Sprzedawca: @{row[0]}\n"
+        f"Ocena: ⭐ {row[1]} ({row[2]} opinii)\n"
+        f"Zgłoszenia: {row[3]}\n"
+        f"Status: {row[4]}"
+    )
+
+# --- FLOW ---
+@dp.message()
+async def flow(message: types.Message):
+    uid = message.from_user.id
+    if uid not in user_state:
+        return
+
+    state = user_state[uid]
     text = message.text.strip()
 
-    if text == "➕ Dodaj sprzedawcę":
-        await message.answer("Podaj @username sprzedawcy:")
-        dp.register_message_handler(add_seller, state=None)
-    elif text == "⭐ Oceń sprzedawcę":
-        await message.answer("Podaj @username sprzedawcy, którego chcesz ocenić:")
-        dp.register_message_handler(rate_seller, state=None)
-    elif text == "🔍 Sprawdź sprzedawcę":
-        await message.answer("Użyj komendy: /check @username")
-    elif text == "👤 Sprawdź klienta":
-        await message.answer("Podaj @username klienta:")
-        dp.register_message_handler(check_client, state=None)
-    elif text == "🏆 TOP sprzedawców":
-        await show_top_sellers(message)
-    else:
-        await message.answer("Nie rozumiem. Wybierz opcję z menu.")
+    # RATE FLOW
+    if state["step"]=="username":
+        cur.execute("SELECT id FROM sellers WHERE username=%s",(text,))
+        row = cur.fetchone()
+        if row:
+            seller_id=row[0]
+        else:
+            cur.execute("INSERT INTO sellers (username) VALUES (%s) RETURNING id",(text,))
+            seller_id=cur.fetchone()[0]
+            conn.commit()
 
-# --- FUNKCJE BOT ---
-async def add_seller(message: types.Message):
-    username = message.text.strip().lstrip("@")
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO sellers (username, rating, reviews, reports, status) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (username) DO NOTHING",
-            (username, 0, 0, 0, "NEW")
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        await message.answer(f"Sprzedawca @{username} dodany ✅")
-    except Exception as e:
-        await message.answer(f"Błąd: {e}")
+        state.update({"seller_id":seller_id,"username":text,"step":"q1"})
+        await message.answer("🛍️ Jakość produktu 1-5")
 
-async def rate_seller(message: types.Message):
-    parts = message.text.strip().split()
-    if len(parts) < 2:
-        await message.answer("Podaj w formacie: @username ocena (np. @user 5)")
-        return
+    elif state["step"]=="q1":
+        state["q1"]=int(text)
+        state["step"]="q2"
+        await message.answer("⏱️ Czas realizacji 1-5")
 
-    username = parts[0].lstrip("@")
-    try:
-        rating = float(parts[1])
-        if rating < 1 or rating > 5:
-            raise ValueError
-    except ValueError:
-        await message.answer("Ocena musi być liczbą od 1 do 5")
-        return
+    elif state["step"]=="q2":
+        state["q2"]=int(text)
+        state["step"]="q3"
+        await message.answer("🤙 Komunikacja 1-5")
 
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT rating, reviews FROM sellers WHERE username=%s", (username,))
-        seller = cur.fetchone()
-        if not seller:
-            await message.answer("Nie znaleziono sprzedawcy")
+    elif state["step"]=="q3":
+        state["q3"]=int(text)
+        state["step"]="q4"
+        await message.answer("🚨 BHP 1-5")
+
+    elif state["step"]=="q4":
+        state["q4"]=int(text)
+        state["step"]="comment"
+        await message.answer("Komentarz lub -")
+
+    elif state["step"]=="comment":
+        try:
+            cur.execute("""
+            INSERT INTO ratings (seller_id, reviewer_username, product_quality, delivery_time, communication, bhp, comment)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,(state["seller_id"], message.from_user.username,
+                 state["q1"], state["q2"], state["q3"], state["q4"], text))
+        except:
+            await message.answer("Już oceniałeś tego sprzedawcę")
+            user_state.pop(uid)
             return
-        new_reviews = seller["reviews"] + 1
-        new_rating = (seller["rating"] * seller["reviews"] + rating) / new_reviews
-        cur.execute(
-            "UPDATE sellers SET rating=%s, reviews=%s WHERE username=%s",
-            (new_rating, new_reviews, username)
-        )
+
+        cur.execute("SELECT product_quality,delivery_time,communication,bhp FROM ratings WHERE seller_id=%s",(state["seller_id"],))
+        ratings=cur.fetchall()
+        avg=calculate_avg(ratings)
+
+        cur.execute("UPDATE sellers SET avg_rating=%s, rating_count=%s WHERE id=%s",
+                    (avg,len(ratings),state["seller_id"]))
         conn.commit()
-        cur.close()
-        conn.close()
-        await message.answer(f"Ocena zaktualizowana ✅ Nowa średnia: {new_rating:.1f} ({new_reviews} opinii)")
-    except Exception as e:
-        await message.answer(f"Błąd: {e}")
 
-async def check_client(message: types.Message):
-    username = message.text.strip().lstrip("@")
-    # tutaj możesz dodać logikę sprawdzania klienta
-    await message.answer(f"Klient @{username} sprawdzony (przykład)")
+        update_status(state["seller_id"])
 
-async def show_top_sellers(message: types.Message):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT username, rating, reviews FROM sellers ORDER BY rating DESC LIMIT 5")
-        sellers = cur.fetchall()
-        cur.close()
-        conn.close()
-        if not sellers:
-            await message.answer("Brak sprzedawców w bazie.")
-            return
-        text = "🏆 TOP 5 sprzedawców:\n"
-        for i, s in enumerate(sellers, 1):
-            text += f"{i}. @{s['username']} ⭐ {s['rating']:.1f} ({s['reviews']} opinii)\n"
-        await message.answer(text)
-    except Exception as e:
-        await message.answer(f"Błąd: {e}")
+        await message.answer(
+            f"✅ Dziękujemy, ocena dodana!\n\n"
+            f"Profil @{state['username']}:\n"
+            f"⭐ {avg} ({len(ratings)} opinii)"
+        )
+        user_state.pop(uid)
 
-# --- START ---
-import asyncio
-
+# --- RUN ---
 async def main():
-    print("Bot i baza danych gotowe!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
