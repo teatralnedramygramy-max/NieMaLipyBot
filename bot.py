@@ -258,6 +258,14 @@ async def flow(message: types.Message):
             SET avg_rating=%s,
                 rating_count=%s
             WHERE id=%s
+
+        import asyncio
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
         """, (avg, len(ratings), state["seller_id"]))
 
         conn.commit()
